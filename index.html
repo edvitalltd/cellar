@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#151118">
+<title>Cliverton Cellars</title>
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23151118'/%3E%3Ctext x='50' y='68' font-size='55' text-anchor='middle'%3E🍷%3C/text%3E%3C/svg%3E">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{margin:0;background:#151118}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ================= CONFIG =================
+const SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbydnDy0qhM4a3wyikWaM3bvb4OCarZmxq9aXSPCdv59o2o80GTVzdpYG-9d8KI2BDnF/exec";
+const TOKEN = "CLIVERTONWINES";
+
+const CELLAR_HEADERS = [
+  "ID","Added","Wine","Producer","Vintage","Region","Subregion","Category",
+  "Bottles","PricePaid","InBond","CurrentValue","WindowStart","WindowEnd",
+  "MerchantWindow","CriticWindow","MerchantNotes","CriticNotes","Description",
+  "CriticScores","Status","Source"
+];
+const JOURNAL_HEADERS = ["Date","WineID","Wine","Vintage","Type","Note","MyScore"];
+const REGION_HEADERS = ["Region","Parent","Overview","Terroir","Climate","Winemaking","History","Grapes"];
+
+// UK duty per 75cl bottle of still wine (editable in Settings)
+const DEFAULT_DUTY = 2.67;
+
+// ================= PALETTE =================
+const C = {
+  bg: "#151118", surface: "#211a26", surface2: "#2a2130",
+  line: "#3a2f42", text: "#ece4d8", dim: "#9c8fa6", faint: "#6f6378",
+  claret: "#a03048", claretDeep: "#7c2338", amber: "#cf9d4e", amberSoft: "#e8c98b",
+  green: "#7da370", white: "#f5efe6",
+};
+
+const font = { fontFamily: "'Fraunces', Georgia, serif" };
+const body = { fontFamily: "'Inter', -apple-system, sans-serif" };
+
+// ================= SHEET API =================
+async function sheetGet(tab) {
+  const r = await fetch(`${SCRIPT_URL}?token=${TOKEN}&tab=${tab}`);
+  return r.json();
+}
+async function sheetPost(payload) {
+  // text/plain avoids CORS preflight, which Apps Script can't handle
+  const r = await fetch(SCRIPT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: JSON.stringify({ token: TOKEN, ...payload }),
+  });
+  return r.json();
+}
+
+// ================= CLAUDE API =================
+function getApiKey() { return localStorage.getItem("cellar_api_key") || ""; }
+async function claude(content, { tools = null, max = 2000 } = {}) {
+  const key = getApiKey();
+  if (!key) throw new Error("no-key");
+  const bodyObj = {
+    model: "claude-sonnet-4-6",
+    max_tokens: max,
+    messages: [{ role: "user", content }],
+  };
+  if (tools) bodyObj.tools = tools;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify(bodyObj),
+  });
+  const data = await r.json();
+  if (data.error) throw new Error(data.error.message || "API error");
+  return (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+}
+function parseJSON(text) {
+  try {
+    const clean = text.replace(/```json|```/g, "").trim();
+    const start = clean.indexOf("{");
+    const end = clean.lastIndexOf("}");
+    return JSON.parse(clean.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+const WEB_SEARCH = [{ type: "web_search_20250305", name: "web_search" }];
+
+async function readLabel(base64, mediaType) {
+  const text = await claude([
+    { type: "image", source: { type: "base64", media_type: mediaType, data: base64 } },
+    { type: "text", text:
+      "Read this wine label. Respond ONLY with JSON, no markdown: " +
+      '{"wine":"","producer":"","vintage":"","region":"","category":"Red|White|Rosé|Sparkling|Sweet|Fortified","priceSeen":""} ' +
+      "priceSeen: any price visible on a shelf tag in the photo, else empty. Unknown fields: empty string." },
+  ]);
+  return parseJSON(text);
+}
+
+async function researchWine(w) {
+  const text = await claude(
+    `Research this wine: ${w.wine} ${w.producer || ""} ${w.vintage || ""}. ` +
+    "Use web search. Respond ONLY with JSON, no markdown: " +
+    '{"region":"","subregion":"","category":"","description":"2-3 sentences","criticNotes":"summary of critic tasting notes",' +
+    '"criticScores":"e.g. Wine Advocate 95, Vinous 93","criticWindow":"e.g. 2028-2045","windowStart":2028,"windowEnd":2045,' +
+    '"currentValue":"approx per-bottle UK market value in GBP, number only or empty"}',
+    { tools: WEB_SEARCH, max: 3000 }
+  );
+  return parseJSON(text);
+}
+
+// ================= HELPERS =================
+const nowYear = new Date().getFullYear();
+const uid = () => "W" + Date.now().toString(36);
+const today = () => new Date().toISOString().slice(0, 10);
+const num = (v) => { const n = parseFloat(String(v).replace(/[£,$]/g, "")); return isNaN(n) ? null : n; };
+
+function windowStatus(w) {
+  const s = num(w.WindowStart), e = num(w.WindowEnd);
+  if (!s && !e) return { key: "unknown", label: "Window unknown" };
+  if (s && nowYear < s) return { key: "wait", label: `Hold until ${s}` };
+  if (e && nowYear > e) return { key: "past", label: `Window closed ${e}` };
+  if (e && e - nowYear <= 2) return { key: "soon", label: `Drink by ${e}` };
+  return { key: "in", label: "In its window" };
+}
+
+function outOfBondCost(price, duty) {
+  if (price == null) return null;
+  return (price + duty) * 1.2;
+}
+
+// ================= SMALL COMPONENTS =================
+function WindowBar({ w, wide }) {
+  const s = num(w.WindowStart), e = num(w.WindowEnd);
+  if (!s || !e || e <= s) return <div className="text-xs" style={{ ...body, color: C.faint }}>window unknown</div>;
+  const span = Math.max(e - s, 1);
+  const pos = Math.min(Math.max((nowYear - s) / span, 0), 1);
+  const st = windowStatus(w);
+  const color = st.key === "wait" ? C.faint : st.key === "soon" ? C.claret : st.key === "past" ? C.claretDeep : C.amber;
+  return (
+    <div style={{ width: wide ? "100%" : 130 }}>
+      <div className="flex justify-between text-xs" style={{ ...body, color: C.dim }}>
+        <span>{s}</span><span>{e}</span>
+      </div>
+      <div className="relative h-2 rounded-full" style={{ background: C.line }}>
+        <div className="absolute h-2 rounded-full" style={{
+          left: 0, width: "100%",
+          background: `linear-gradient(90deg, ${C.amberSoft}33, ${C.amber}, ${C.claret})`,
+          opacity: st.key === "wait" ? 0.25 : 1,
+        }} />
+        <div className="absolute w-1 rounded" style={{
+          left: `${pos * 100}%`, top: -3, height: 14, background: C.white,
+          boxShadow: `0 0 6px ${color}`,
+        }} />
+      </div>
+      <div className="text-xs mt-1" style={{ ...body, color }}>{st.label}</div>
+    </div>
+  );
+}
+
+function Btn({ children, onClick, primary, small, disabled }) {
+  return (
+    <button onClick={onClick} disabled={disabled}
+      className={`rounded-lg ${small ? "px-3 py-1.5 text-sm" : "px-4 py-2.5"}`}
+      style={{ ...body,
+        background: primary ? C.claret : C.surface2,
+        color: primary ? C.white : C.text,
+        border: `1px solid ${primary ? C.claret : C.line}`,
+        opacity: disabled ? 0.5 : 1,
+      }}>
+      {children}
+    </button>
+  );
+}
+
+function Field({ label, value, onChange, type = "text", placeholder }) {
+  return (
+    <label className="block mb-3">
+      <div className="text-xs uppercase tracking-wider mb-1" style={{ ...body, color: C.dim }}>
+        {label} <span style={{ color: C.faint }}>· optional</span>
+      </div>
+      <input type={type} value={value} placeholder={placeholder || "leave blank to fill in later"}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded-lg px-3 py-2.5"
+        style={{ ...body, background: C.bg, color: C.text, border: `1px solid ${C.line}` }} />
+    </label>
+  );
+}
+
+function CameraInput({ onImage, label }) {
+  const ref = useRef();
+  return (
+    <>
+      <input ref={ref} type="file" accept="image/*" capture="environment" className="hidden"
+        onChange={(e) => {
+          const f = e.target.files[0];
+          if (!f) return;
+          const r = new FileReader();
+          r.onload = () => onImage(r.result.split(",")[1], f.type);
+          r.readAsDataURL(f);
+          e.target.value = "";
+        }} />
+      <Btn primary onClick={() => ref.current.click()}>{label}</Btn>
+    </>
+  );
+}
+
+function Spinner({ text }) {
+  return (
+    <div className="flex items-center gap-3 py-4" style={{ ...body, color: C.amber }}>
+      <div className="w-4 h-4 rounded-full border-2 animate-spin"
+        style={{ borderColor: `${C.amber} transparent ${C.amber} ${C.amber}` }} />
+      {text}
+    </div>
+  );
+}
+
+// ================= GUIDED SCORING =================
+const SCORE_STEPS = [
+  { key: "appearance", label: "Appearance", max: 5 },
+  { key: "nose", label: "Nose", max: 15 },
+  { key: "palate", label: "Palate & finish", max: 20 },
+  { key: "overall", label: "Overall & ageing potential", max: 10 },
+];
+
+function GuidedScore({ wine, onDone, onCancel }) {
+  const [guide, setGuide] = useState(null);
+  const [scores, setScores] = useState({ appearance: 4, nose: 12, palate: 16, overall: 8 });
+  const [step, setStep] = useState(0);
+  useEffect(() => {
+    (async () => {
+      const text = await claude(
+        `I'm tasting ${wine.Wine} ${wine.Vintage || ""} (${wine.Category || "wine"}, ${wine.Region || "unknown region"}). ` +
+        "For the 100-point scoring method (50 base + appearance/5 + nose/15 + palate & finish/20 + overall & ageing/10), " +
+        "give guidance SPECIFIC to this wine's type, age and region: what to look for at each step, what is correct for this wine vs a fault, " +
+        "how not to mis-score its style. Respond ONLY with JSON, no markdown: " +
+        '{"appearance":"2-3 sentences","nose":"2-3 sentences","palate":"2-3 sentences","overall":"2-3 sentences"}'
+      );
+      setGuide(parseJSON(text) || {});
+    })();
+  }, []);
+  const total = 50 + Object.values(scores).reduce((a, b) => a + b, 0);
+  const s = SCORE_STEPS[step];
+  return (
+    <div className="rounded-xl p-4 mt-3" style={{ background: C.surface2, border: `1px solid ${C.line}` }}>
+      <div className="flex justify-between items-baseline">
+        <div style={{ ...font, fontSize: 18, color: C.amberSoft }}>Guided scoring</div>
+        <div style={{ ...font, fontSize: 28, color: C.white }}>{total}<span className="text-sm" style={{ color: C.dim }}>/100</span></div>
+      </div>
+      <div className="text-xs mb-3" style={{ ...body, color: C.dim }}>
+        Step {step + 1} of 4 · every wine starts at 50
+      </div>
+      <div style={{ ...font, fontSize: 16, color: C.text }}>{s.label} <span style={{ color: C.dim }}>· up to {s.max} pts</span></div>
+      {guide === null ? <Spinner text="Preparing guidance for this wine…" /> : (
+        <p className="text-sm my-2 leading-relaxed" style={{ ...body, color: C.dim }}>{guide[s.key] || ""}</p>
+      )}
+      <input type="range" min={0} max={s.max} value={scores[s.key]}
+        onChange={(e) => setScores({ ...scores, [s.key]: +e.target.value })}
+        className="w-full" style={{ accentColor: C.claret }} />
+      <div className="text-center mb-3" style={{ ...body, color: C.amber }}>{scores[s.key]} / {s.max}</div>
+      <div className="flex gap-2 justify-between">
+        <Btn small onClick={step === 0 ? onCancel : () => setStep(step - 1)}>{step === 0 ? "Cancel" : "Back"}</Btn>
+        {step < 3
+          ? <Btn small primary onClick={() => setStep(step + 1)}>Next</Btn>
+          : <Btn small primary onClick={() => onDone(total)}>Save score {total}</Btn>}
+      </div>
+    </div>
+  );
+}
+
+// ================= WINE DETAIL =================
+function WineDetail({ wine, journal, regions, onBack, onWithdraw, onAddNote, onSaveFields, onResearchRegion, dutyRate }) {
+  const [note, setNote] = useState("");
+  const [scoring, setScoring] = useState(false);
+  const [pendingScore, setPendingScore] = useState(null);
+  const [edit, setEdit] = useState({ Bottles: wine.Bottles || "", PricePaid: wine.PricePaid || "", CurrentValue: wine.CurrentValue || "" });
+  const entries = journal.filter((j) => j.WineID === wine.ID).sort((a, b) => (a.Date < b.Date ? 1 : -1));
+  const region = regions.find((r) => [wine.Region, wine.Subregion].includes(r.Region));
+  const price = num(wine.PricePaid);
+  const oob = wine.InBond === "Yes" && price != null ? outOfBondCost(price, dutyRate) : null;
+
+  const saveNote = (score) => {
+    onAddNote(wine, note, score);
+    setNote(""); setPendingScore(null); setScoring(false);
+  };
+
+  return (
+    <div>
+      <button onClick={onBack} className="text-sm mb-3" style={{ ...body, color: C.amber }}>← back</button>
+      <div style={{ ...font, fontSize: 26, color: C.white, lineHeight: 1.15 }}>{wine.Wine}</div>
+      <div className="mb-1" style={{ ...body, color: C.dim }}>
+        {[wine.Producer, wine.Vintage, wine.Subregion || wine.Region, wine.Category].filter(Boolean).join(" · ")}
+      </div>
+      <div className="my-3"><WindowBar w={wine} wide /></div>
+
+      <div className="grid grid-cols-3 gap-2 my-3">
+        {[
+          ["Bottles", wine.Bottles || "—"],
+          ["Paid", price != null ? `£${price}` : "—"],
+          ["Value", num(wine.CurrentValue) != null ? `£${num(wine.CurrentValue)}` : "—"],
+        ].map(([l, v]) => (
+          <div key={l} className="rounded-lg p-2 text-center" style={{ background: C.surface2 }}>
+            <div className="text-xs" style={{ ...body, color: C.dim }}>{l}</div>
+            <div style={{ ...font, fontSize: 20, color: C.text }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      {wine.InBond === "Yes" && (
+        <div className="text-xs rounded-lg p-2 mb-3" style={{ ...body, color: C.amberSoft, background: `${C.amber}18`, border: `1px solid ${C.amber}44` }}>
+          In bond · cost if withdrawn: {oob != null ? `£${oob.toFixed(2)}/bottle` : "add price paid to calculate"} (duty £{dutyRate.toFixed(2)} + 20% VAT)
+        </div>
+      )}
+
+      {wine.Description && <p className="text-sm leading-relaxed mb-2" style={{ ...body, color: C.text }}>{wine.Description}</p>}
+      {wine.CriticScores && <div className="text-sm mb-1" style={{ ...body, color: C.amber }}>{wine.CriticScores}</div>}
+      {wine.CriticNotes && (
+        <div className="mb-2"><div className="text-xs uppercase tracking-wider" style={{ ...body, color: C.faint }}>Critics say</div>
+          <p className="text-sm" style={{ ...body, color: C.dim }}>{wine.CriticNotes}</p></div>
+      )}
+      {wine.MerchantNotes && (
+        <div className="mb-2"><div className="text-xs uppercase tracking-wider" style={{ ...body, color: C.faint }}>Merchant notes</div>
+          <p className="text-sm" style={{ ...body, color: C.dim }}>{wine.MerchantNotes}</p></div>
+      )}
+
+      {/* Region library link */}
+      <div className="rounded-xl p-3 my-3" style={{ background: C.surface2, border: `1px solid ${C.line}` }}>
+        <div style={{ ...font, fontSize: 16, color: C.amberSoft }}>About {wine.Subregion || wine.Region || "this region"}</div>
+        {region ? (
+          <div className="text-sm mt-1" style={{ ...body, color: C.dim }}>
+            {region.Overview}
+            {["Terroir", "Climate", "Winemaking", "History", "Grapes"].map((k) => region[k] && (
+              <div key={k} className="mt-2"><span style={{ color: C.amber }}>{k}. </span>{region[k]}</div>
+            ))}
+          </div>
+        ) : (wine.Region || wine.Subregion) ? (
+          <div className="mt-2"><Btn small onClick={() => onResearchRegion(wine.Subregion || wine.Region)}>Research this region</Btn></div>
+        ) : <div className="text-sm" style={{ ...body, color: C.faint }}>No region recorded yet</div>}
+      </div>
+
+      {/* Fill in the gaps */}
+      <details className="my-3">
+        <summary className="text-sm cursor-pointer" style={{ ...body, color: C.amber }}>Edit bottles / prices</summary>
+        <div className="mt-2">
+          <Field label="Bottles" type="number" value={edit.Bottles} onChange={(v) => setEdit({ ...edit, Bottles: v })} />
+          <Field label="Price paid per bottle (£)" value={edit.PricePaid} onChange={(v) => setEdit({ ...edit, PricePaid: v })} />
+          <Field label="Current value per bottle (£)" value={edit.CurrentValue} onChange={(v) => setEdit({ ...edit, CurrentValue: v })} />
+          <Btn small primary onClick={() => onSaveFields(wine, edit)}>Save</Btn>
+        </div>
+      </details>
+
+      {/* Journal */}
+      <div style={{ ...font, fontSize: 18, color: C.amberSoft }} className="mt-4 mb-1">Your tasting journal</div>
+      {entries.length === 0 && <div className="text-sm" style={{ ...body, color: C.faint }}>No entries yet — your notes across the years will build up here.</div>}
+      {entries.map((e, i) => (
+        <div key={i} className="rounded-lg p-3 mb-2" style={{ background: C.surface2, borderLeft: `3px solid ${C.claret}` }}>
+          <div className="text-xs" style={{ ...body, color: C.amber }}>
+            {e.Date} · {e.Type}{e.MyScore ? ` · your score ${e.MyScore}` : ""}
+          </div>
+          <div className="text-sm" style={{ ...body, color: C.text }}>{e.Note}</div>
+        </div>
+      ))}
+
+      <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3}
+        placeholder="Your note — e.g. tight, would benefit from another year or two…"
+        className="w-full rounded-lg p-3 mt-2" style={{ ...body, background: C.bg, color: C.text, border: `1px solid ${C.line}` }} />
+      {scoring
+        ? <GuidedScore wine={wine} onCancel={() => setScoring(false)} onDone={(t) => { setPendingScore(t); setScoring(false); }} />
+        : pendingScore && <div className="text-sm my-1" style={{ ...body, color: C.amber }}>Score to save: {pendingScore}/100</div>}
+      <div className="flex flex-wrap gap-2 mt-2">
+        {!scoring && <Btn small onClick={() => setScoring(true)}>{pendingScore ? "Rescore" : "Guided score"}</Btn>}
+        <Btn small onClick={() => saveNote(pendingScore)} disabled={!note && !pendingScore}>Save note only</Btn>
+        <Btn small primary disabled={!num(wine.Bottles)} onClick={() => { onWithdraw(wine, note, pendingScore); setNote(""); setPendingScore(null); }}>
+          Drink one ({wine.Bottles || 0} left)
+        </Btn>
+      </div>
+    </div>
+  );
+}
+
+// ================= SCAN FLOW (Add / Drink / Lookup / Shopping share it) =================
+function ScanCard({ mode, cellar, onAddToCellar, onOpenWine, shoppingList, setShoppingList }) {
+  const [busy, setBusy] = useState(null);
+  const [scan, setScan] = useState(null);      // label extraction result
+  const [research, setResearch] = useState(null);
+  const [matches, setMatches] = useState([]);
+  const [fields, setFields] = useState({ Bottles: "", PricePaid: "", InBond: false });
+
+  const reset = () => { setScan(null); setResearch(null); setMatches([]); setFields({ Bottles: "", PricePaid: "", InBond: false }); };
+
+  const onImage = async (b64, type) => {
+    reset(); setBusy("Reading label…");
+    const label = await readLabel(b64, type);
+    if (!label || !label.wine) { setBusy(null); setScan({ error: true }); return; }
+    setScan(label);
+    if (label.priceSeen) setFields((f) => ({ ...f, PricePaid: label.priceSeen }));
+    if (mode === "drink") {
+      const q = label.wine.toLowerCase();
+      const m = cellar.filter((w) =>
+        (w.Wine || "").toLowerCase().includes(q.split(" ")[0]) ||
+        q.includes((w.Wine || "").toLowerCase().split(" ")[0])
+      ).filter((w) => !label.vintage || String(w.Vintage) === String(label.vintage) || !w.Vintage);
+      setMatches(m.length ? m : cellar);
+      setBusy(null);
+      return;
+    }
+    setBusy("Researching this wine…");
+    const res = await researchWine(label);
+    setResearch(res || {});
+    setBusy(null);
+  };
+
+  const buildRow = (status) => ({
+    ID: uid(), Added: today(),
+    Wine: scan.wine, Producer: scan.producer || "", Vintage: scan.vintage || "",
+    Region: research?.region || scan.region || "", Subregion: research?.subregion || "",
+    Category: research?.category || scan.category || "",
+    Bottles: fields.Bottles, PricePaid: fields.PricePaid,
+    InBond: fields.InBond ? "Yes" : "No",
+    CurrentValue: research?.currentValue || "",
+    WindowStart: research?.windowStart || "", WindowEnd: research?.windowEnd || "",
+    CriticWindow: research?.criticWindow || "", MerchantWindow: "",
+    MerchantNotes: "", CriticNotes: research?.criticNotes || "",
+    Description: research?.description || "", CriticScores: research?.criticScores || "",
+    Status: status, Source: "app scan",
+  });
+
+  return (
+    <div>
+      <div className="flex gap-2 items-center flex-wrap">
+        <CameraInput label={mode === "shopping" ? "📷 Snap a bottle in store" : "📷 Snap the label"} onImage={onImage} />
+        {scan && <Btn small onClick={reset}>Clear</Btn>}
+      </div>
+      {busy && <Spinner text={busy} />}
+      {scan?.error && <div className="text-sm mt-2" style={{ ...body, color: C.claret }}>Couldn't read that label — try again with the label filling the frame.</div>}
+
+      {/* Drink mode: pick the match */}
+      {mode === "drink" && scan && !scan.error && (
+        <div className="mt-3">
+          <div className="text-sm mb-2" style={{ ...body, color: C.dim }}>
+            Read: <span style={{ color: C.text }}>{scan.wine} {scan.vintage}</span> — which bottle is it?
+          </div>
+          {matches.map((w) => (
+            <button key={w._row} onClick={() => onOpenWine(w)} className="block w-full text-left rounded-lg p-3 mb-2"
+              style={{ background: C.surface2, border: `1px solid ${C.line}` }}>
+              <span style={{ ...font, color: C.text }}>{w.Wine}</span>
+              <span className="text-sm" style={{ ...body, color: C.dim }}> {w.Vintage} · {w.Bottles || "?"} left</span>
+            </button>
+          ))}
+          {matches.length === 0 && <div className="text-sm" style={{ ...body, color: C.faint }}>Nothing similar in the cellar.</div>}
+        </div>
+      )}
+
+      {/* Add / Lookup / Shopping: show research card */}
+      {mode !== "drink" && scan && !scan.error && (
+        <div className="rounded-xl p-4 mt-3" style={{ background: C.surface, border: `1px solid ${C.line}` }}>
+          <div style={{ ...font, fontSize: 20, color: C.white }}>{scan.wine}</div>
+          <div className="text-sm mb-2" style={{ ...body, color: C.dim }}>
+            {[scan.producer, scan.vintage, research?.subregion || research?.region || scan.region, research?.category || scan.category].filter(Boolean).join(" · ")}
+          </div>
+          {research && (
+            <>
+              {(research.windowStart || research.windowEnd) &&
+                <WindowBar w={{ WindowStart: research.windowStart, WindowEnd: research.windowEnd }} wide />}
+              {research.criticScores && <div className="text-sm mt-2" style={{ ...body, color: C.amber }}>{research.criticScores}</div>}
+              {research.description && <p className="text-sm mt-1" style={{ ...body, color: C.text }}>{research.description}</p>}
+              {research.criticNotes && <p className="text-sm mt-1" style={{ ...body, color: C.dim }}>{research.criticNotes}</p>}
+              {research.currentValue && <div className="text-sm mt-1" style={{ ...body, color: C.dim }}>Approx value £{research.currentValue}</div>}
+            </>
+          )}
+          {(mode === "add" || mode === "shopping") && (
+            <div className="mt-3">
+              <Field label="Bottles" type="number" value={fields.Bottles} onChange={(v) => setFields({ ...fields, Bottles: v })} />
+              <Field label="Price per bottle (£)" value={fields.PricePaid} onChange={(v) => setFields({ ...fields, PricePaid: v })} />
+              <label className="flex items-center gap-2 mb-3 text-sm" style={{ ...body, color: C.dim }}>
+                <input type="checkbox" checked={fields.InBond} onChange={(e) => setFields({ ...fields, InBond: e.target.checked })}
+                  style={{ accentColor: C.claret }} /> Bought in bond
+              </label>
+              {mode === "add" && <Btn primary onClick={() => { onAddToCellar(buildRow("In cellar")); reset(); }}>Add to cellar</Btn>}
+              {mode === "shopping" && <Btn primary onClick={() => { setShoppingList([...shoppingList, buildRow("Considering")]); reset(); }}>Add to shopping list</Btn>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Shopping list */}
+      {mode === "shopping" && shoppingList.length > 0 && !scan && (
+        <div className="mt-4">
+          <div style={{ ...font, fontSize: 18, color: C.amberSoft }}>This trip · tap what you bought</div>
+          {shoppingList.map((w, i) => (
+            <div key={w.ID} className="rounded-lg p-3 mt-2 flex justify-between items-center gap-2"
+              style={{ background: C.surface2, border: `1px solid ${C.line}` }}>
+              <div>
+                <div style={{ ...font, color: C.text }}>{w.Wine} <span className="text-sm" style={{ ...body, color: C.dim }}>{w.Vintage}</span></div>
+                <div className="text-xs" style={{ ...body, color: C.dim }}>{w.CriticScores || w.Region}{w.PricePaid ? ` · £${w.PricePaid}` : ""}</div>
+              </div>
+              <div className="flex gap-1">
+                <Btn small primary onClick={() => { onAddToCellar({ ...w, Status: "In cellar" }); setShoppingList(shoppingList.filter((x) => x.ID !== w.ID)); }}>Bought</Btn>
+                <Btn small onClick={() => { onAddToCellar(w); setShoppingList(shoppingList.filter((x) => x.ID !== w.ID)); }}>Passed</Btn>
+              </div>
+            </div>
+          ))}
+          <div className="text-xs mt-2" style={{ ...body, color: C.faint }}>"Passed" keeps it in your considered history for next time.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ================= MAIN APP =================
+function WineCellar() {
+  const [view, setView] = useState("browse");
+  const [cellarRaw, setCellarRaw] = useState([]);
+  const [journal, setJournal] = useState([]);
+  const [regions, setRegions] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [shoppingList, setShoppingList] = useState([]);
+  const [dutyRate, setDutyRate] = useState(DEFAULT_DUTY);
+  const [apiKey, setApiKeyState] = useState(getApiKey());
+  const saveApiKey = (k) => { localStorage.setItem("cellar_api_key", k.trim()); setApiKeyState(k.trim()); };
+  const [toast, setToast] = useState(null);
+
+  const flash = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2500); };
+
+  useEffect(() => {
+    const l = document.createElement("link");
+    l.rel = "stylesheet";
+    l.href = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500&display=swap";
+    document.head.appendChild(l);
+    loadAll();
+  }, []);
+
+  async function loadAll() {
+    setLoading(true); setError(null);
+    try {
+      // first-run: write headers into any tab that lacks them
+      const setups = [["Cellar", CELLAR_HEADERS], ["Journal", JOURNAL_HEADERS], ["Regions", REGION_HEADERS]];
+      for (const [tab, headers] of setups) {
+        const d = await sheetGet(tab);
+        if (d.error) throw new Error(d.error);
+        if (!d.headers || !d.headers[0]) await sheetPost({ tab, action: "setupHeaders", headers });
+      }
+      const [c, j, r] = await Promise.all([sheetGet("Cellar"), sheetGet("Journal"), sheetGet("Regions")]);
+      setCellarRaw(c.rows || []); setJournal(j.rows || []); setRegions(r.rows || []);
+    } catch (e) {
+      setError(String(e.message || e));
+    }
+    setLoading(false);
+  }
+
+  const cellar = useMemo(() => cellarRaw.filter((w) => w.Status !== "Considering"), [cellarRaw]);
+  const considered = useMemo(() => cellarRaw.filter((w) => w.Status === "Considering"), [cellarRaw]);
+
+  async function addToCellar(row) {
+    await sheetPost({ tab: "Cellar", action: "append", fields: row });
+    flash(row.Status === "Considering" ? "Saved to considered history" : `${row.Wine} added to cellar`);
+    loadAll();
+  }
+  async function saveFields(wine, fields) {
+    await sheetPost({ tab: "Cellar", action: "update", row: wine._row, fields });
+    flash("Saved"); loadAll();
+  }
+  async function addNote(wine, note, score) {
+    await sheetPost({ tab: "Journal", action: "append",
+      fields: { Date: today(), WineID: wine.ID, Wine: wine.Wine, Vintage: wine.Vintage, Type: "note", Note: note, MyScore: score || "" } });
+    flash("Journal entry saved"); loadAll();
+  }
+  async function withdraw(wine, note, score) {
+    const left = (num(wine.Bottles) || 1) - 1;
+    await sheetPost({ tab: "Cellar", action: "update", row: wine._row, fields: { Bottles: left, Status: left === 0 ? "Finished" : "In cellar" } });
+    await sheetPost({ tab: "Journal", action: "append",
+      fields: { Date: today(), WineID: wine.ID, Wine: wine.Wine, Vintage: wine.Vintage, Type: "drank", Note: note || "", MyScore: score || "" } });
+    flash(`Enjoy! ${left} bottle${left === 1 ? "" : "s"} left`);
+    setSelected(null); setView("browse"); loadAll();
+  }
+  async function researchRegion(name) {
+    flash(`Researching ${name}…`);
+    const text = await claude(
+      `Write a wine-lover's reference entry on the wine region/appellation "${name}". Use web search if needed. ` +
+      "Respond ONLY with JSON, no markdown: " +
+      '{"Region":"' + name + '","Parent":"parent region if any","Overview":"3-4 sentences","Terroir":"2-3 sentences on soils",' +
+      '"Climate":"2 sentences","Winemaking":"2-3 sentences on style/traditions","History":"2-3 sentences","Grapes":"key varieties"}',
+      { tools: WEB_SEARCH, max: 2500 }
+    );
+    const entry = parseJSON(text);
+    if (entry) { await sheetPost({ tab: "Regions", action: "append", fields: entry }); flash(`${name} added to your library`); loadAll(); }
+    else flash("Research failed — try again");
+  }
+
+  const filtered = useMemo(() => {
+    let list = cellar.filter((w) => num(w.Bottles) !== 0 || filter === "finished");
+    if (filter === "red") list = list.filter((w) => w.Category === "Red");
+    if (filter === "white") list = list.filter((w) => w.Category === "White");
+    if (filter === "window") list = list.filter((w) => ["in", "soon"].includes(windowStatus(w).key));
+    if (filter === "soon") list = list.filter((w) => windowStatus(w).key === "soon");
+    if (filter === "incomplete") list = list.filter((w) => !w.Bottles || !w.PricePaid || !w.WindowEnd);
+    if (filter === "finished") list = cellar.filter((w) => w.Status === "Finished");
+    if (search) list = list.filter((w) => (w.Wine + " " + w.Producer + " " + w.Region + " " + w.Vintage).toLowerCase().includes(search.toLowerCase()));
+    return list.sort((a, b) => (num(a.WindowEnd) || 9999) - (num(b.WindowEnd) || 9999));
+  }, [cellar, filter, search]);
+
+  const drinkSoon = cellar.filter((w) => windowStatus(w).key === "soon" && num(w.Bottles) > 0);
+
+  const NAV = [["browse", "Cellar"], ["add", "Add"], ["drink", "Drink"], ["lookup", "Lookup"], ["shopping", "Shopping"], ["library", "Library"]];
+
+  return (
+    <div className="min-h-screen" style={{ background: C.bg }}>
+      <style>{`
+        @media (prefers-reduced-motion: reduce) { .animate-spin { animation: none } }
+        details summary::-webkit-details-marker { color: ${C.amber} }
+        input[type=range]::-webkit-slider-thumb { cursor: pointer }
+      `}</style>
+      <div className="max-w-5xl mx-auto px-4 pb-24 md:pb-8 pt-5">
+        {/* Header */}
+        <div className="flex items-baseline justify-between mb-4">
+          <div>
+            <div style={{ ...font, fontSize: 24, color: C.white }}>Cliverton Cellars</div>
+            <div className="text-xs" style={{ ...body, color: C.faint }}>
+              {cellar.reduce((a, w) => a + (num(w.Bottles) || 0), 0)} bottles · {cellar.filter((w) => num(w.Bottles) > 0).length} wines
+            </div>
+          </div>
+          <button onClick={loadAll} className="text-sm" style={{ ...body, color: C.amber }}>↻ refresh</button>
+        </div>
+
+        {/* Desktop nav */}
+        <div className="hidden md:flex gap-1 mb-5">
+          {NAV.map(([k, l]) => (
+            <button key={k} onClick={() => { setView(k); setSelected(null); }}
+              className="px-4 py-2 rounded-lg text-sm"
+              style={{ ...body, background: view === k ? C.claret : "transparent", color: view === k ? C.white : C.dim }}>
+              {l}{k === "shopping" && shoppingList.length ? ` (${shoppingList.length})` : ""}
+            </button>
+          ))}
+        </div>
+
+        {loading && <Spinner text="Opening the cellar…" />}
+        {error && (
+          <div className="rounded-lg p-3 text-sm" style={{ ...body, background: `${C.claret}22`, color: C.text, border: `1px solid ${C.claret}` }}>
+            Can't reach your Sheet: {error}. Check the Apps Script deployment, then ↻ refresh.
+          </div>
+        )}
+
+        {!loading && !error && !apiKey && (
+          <div className="rounded-xl p-4 mb-4" style={{ background: C.surface, border: `1px solid ${C.amber}55` }}>
+            <div style={{ ...font, fontSize: 17, color: C.amberSoft }}>One-time setup on this device</div>
+            <p className="text-sm my-2" style={{ ...body, color: C.dim }}>
+              Label scanning and research need your Anthropic API key. Create one at console.anthropic.com → API keys, then paste it here. Browsing and journal work without it.
+            </p>
+            <Field label="Anthropic API key" value={apiKey} onChange={saveApiKey} placeholder="sk-ant-..." />
+          </div>
+        )}
+        {!loading && !error && (
+          <div className="md:grid md:grid-cols-5 md:gap-6">
+            {/* LEFT PANE (list) — full width on phone unless detail open */}
+            <div className={`md:col-span-2 ${selected ? "hidden md:block" : ""}`}>
+              {view === "browse" && (
+                <>
+                  {drinkSoon.length > 0 && filter === "all" && (
+                    <button onClick={() => setFilter("soon")} className="w-full text-left rounded-xl p-3 mb-3"
+                      style={{ background: `linear-gradient(90deg, ${C.claretDeep}, ${C.claret})`, border: `1px solid ${C.claret}` }}>
+                      <div style={{ ...font, color: C.white }}>🍷 {drinkSoon.length} wine{drinkSoon.length > 1 ? "s" : ""} nearing the end of their window</div>
+                      <div className="text-xs" style={{ ...body, color: C.amberSoft }}>tap to see what to open first</div>
+                    </button>
+                  )}
+                  <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search the cellar…"
+                    className="w-full rounded-lg px-3 py-2 mb-2"
+                    style={{ ...body, background: C.surface, color: C.text, border: `1px solid ${C.line}` }} />
+                  <div className="flex gap-1 flex-wrap mb-3">
+                    {[["all", "All"], ["window", "Drink now"], ["soon", "Drink soon"], ["red", "Red"], ["white", "White"], ["incomplete", "Needs info"], ["finished", "Finished"]].map(([k, l]) => (
+                      <button key={k} onClick={() => setFilter(k)} className="px-3 py-1 rounded-full text-xs"
+                        style={{ ...body, background: filter === k ? C.amber : C.surface2, color: filter === k ? C.bg : C.dim }}>
+                        {l}
+                      </button>
+                    ))}
+                  </div>
+                  {filtered.length === 0 && (
+                    <div className="text-sm rounded-xl p-6 text-center" style={{ ...body, color: C.faint, border: `1px dashed ${C.line}` }}>
+                      Nothing here yet. Add your first wine with the Add tab — or wait for Cowork to deliver your in-bond purchases.
+                    </div>
+                  )}
+                  {filtered.map((w) => (
+                    <button key={w._row} onClick={() => setSelected(w)} className="w-full text-left rounded-xl p-3 mb-2 flex justify-between items-center gap-3"
+                      style={{ background: selected?._row === w._row ? C.surface2 : C.surface, border: `1px solid ${C.line}` }}>
+                      <div className="min-w-0">
+                        <div className="truncate" style={{ ...font, fontSize: 16, color: C.text }}>{w.Wine}</div>
+                        <div className="text-xs truncate" style={{ ...body, color: C.dim }}>
+                          {[w.Vintage, w.Subregion || w.Region, w.Category].filter(Boolean).join(" · ")}
+                          {num(w.Bottles) != null ? ` · ${w.Bottles} btl` : " · btls?"}
+                        </div>
+                      </div>
+                      <WindowBar w={w} />
+                    </button>
+                  ))}
+                </>
+              )}
+
+              {view === "add" && <ScanCard mode="add" cellar={cellar} onAddToCellar={addToCellar} onOpenWine={setSelected} shoppingList={shoppingList} setShoppingList={setShoppingList} />}
+              {view === "drink" && <ScanCard mode="drink" cellar={cellar} onAddToCellar={addToCellar} onOpenWine={setSelected} shoppingList={shoppingList} setShoppingList={setShoppingList} />}
+              {view === "lookup" && <ScanCard mode="lookup" cellar={cellar} onAddToCellar={addToCellar} onOpenWine={setSelected} shoppingList={shoppingList} setShoppingList={setShoppingList} />}
+              {view === "shopping" && (
+                <>
+                  <ScanCard mode="shopping" cellar={cellar} onAddToCellar={addToCellar} onOpenWine={setSelected} shoppingList={shoppingList} setShoppingList={setShoppingList} />
+                  {considered.length > 0 && (
+                    <details className="mt-4">
+                      <summary className="text-sm cursor-pointer" style={{ ...body, color: C.amber }}>Considered before ({considered.length})</summary>
+                      {considered.map((w) => (
+                        <div key={w._row} className="text-sm rounded-lg p-2 mt-1" style={{ ...body, background: C.surface, color: C.dim }}>
+                          {w.Wine} {w.Vintage} {w.CriticScores && `· ${w.CriticScores}`}
+                        </div>
+                      ))}
+                    </details>
+                  )}
+                </>
+              )}
+
+              {view === "library" && (
+                <>
+                  <div style={{ ...font, fontSize: 20, color: C.amberSoft }} className="mb-2">Your regions</div>
+                  {regions.length === 0 && <div className="text-sm" style={{ ...body, color: C.faint }}>The library grows as your cellar does — open any wine and tap "Research this region".</div>}
+                  {regions.map((r) => (
+                    <details key={r._row} className="rounded-xl p-3 mb-2" style={{ background: C.surface, border: `1px solid ${C.line}` }}>
+                      <summary className="cursor-pointer" style={{ ...font, fontSize: 17, color: C.text }}>
+                        {r.Region} {r.Parent && <span className="text-xs" style={{ ...body, color: C.faint }}>· {r.Parent}</span>}
+                      </summary>
+                      <div className="text-sm mt-2" style={{ ...body, color: C.dim }}>
+                        {r.Overview}
+                        {["Terroir", "Climate", "Winemaking", "History", "Grapes"].map((k) => r[k] && (
+                          <div key={k} className="mt-2"><span style={{ color: C.amber }}>{k}. </span>{r[k]}</div>
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                  <details className="mt-3">
+                    <summary className="text-sm cursor-pointer" style={{ ...body, color: C.amber }}>Settings</summary>
+                    <div className="mt-2">
+                      <Field label={`UK duty per bottle (still wine) — currently £${dutyRate}`} value={String(dutyRate)} onChange={(v) => setDutyRate(num(v) || DEFAULT_DUTY)} />
+                      <Field label="Anthropic API key (for scanning & research)" value={apiKey} onChange={saveApiKey} placeholder="sk-ant-..." />
+                      <div className="text-xs" style={{ ...body, color: C.faint }}>Stored only on this device. Get a key at console.anthropic.com.</div>
+                    </div>
+                  </details>
+                </>
+              )}
+            </div>
+
+            {/* RIGHT PANE (detail) */}
+            <div className={`md:col-span-3 ${selected ? "" : "hidden md:block"}`}>
+              {selected ? (
+                <WineDetail wine={cellar.find((w) => w._row === selected._row) || selected}
+                  journal={journal} regions={regions} dutyRate={dutyRate}
+                  onBack={() => setSelected(null)} onWithdraw={withdraw} onAddNote={addNote}
+                  onSaveFields={saveFields} onResearchRegion={researchRegion} />
+              ) : (
+                <div className="hidden md:flex items-center justify-center h-64 rounded-xl text-sm"
+                  style={{ ...body, color: C.faint, border: `1px dashed ${C.line}` }}>
+                  Select a wine to read about it
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Mobile bottom nav */}
+      <div className="md:hidden fixed bottom-0 left-0 right-0 flex justify-around py-2"
+        style={{ background: `${C.surface}f2`, borderTop: `1px solid ${C.line}`, backdropFilter: "blur(8px)" }}>
+        {NAV.map(([k, l]) => (
+          <button key={k} onClick={() => { setView(k); setSelected(null); }} className="px-2 py-1 text-xs rounded"
+            style={{ ...body, color: view === k ? C.amber : C.dim }}>
+            {l}{k === "shopping" && shoppingList.length ? `·${shoppingList.length}` : ""}
+          </button>
+        ))}
+      </div>
+
+      {toast && (
+        <div className="fixed bottom-16 md:bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm"
+          style={{ ...body, background: C.amber, color: C.bg }}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<WineCellar />);
+</script>
+</body>
+</html>
