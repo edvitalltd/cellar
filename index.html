@@ -12,7 +12,37 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
-<style>body{margin:0;background:#151118}</style>
+<style>
+body{margin:0;background:#151118}
+/* keep content clear of the iPhone notch/status bar and home indicator */
+.app-shell{
+  padding-top:calc(env(safe-area-inset-top, 0px) + 20px);
+  padding-left:max(16px, env(safe-area-inset-left, 0px));
+  padding-right:max(16px, env(safe-area-inset-right, 0px));
+  padding-bottom:calc(env(safe-area-inset-bottom, 0px) + 24px);
+}
+/* home tiles fill the space left under the header */
+.home-grid{
+  grid-template-rows:repeat(3, 1fr);
+  height:calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 130px);
+  min-height:420px;
+}
+.home-tile{transition:transform .12s ease, border-color .12s ease}
+.home-tile:active{transform:scale(.97)}
+.home-tile:focus-visible{outline:2px solid #cf9d4e; outline-offset:2px}
+@media (prefers-reduced-motion: reduce){ .home-tile{transition:none} .home-tile:active{transform:none} }
+.bottom-nav{
+  padding-bottom:calc(env(safe-area-inset-bottom, 0px) + 10px);
+  padding-left:env(safe-area-inset-left, 0px);
+  padding-right:env(safe-area-inset-right, 0px);
+}
+.app-toast{bottom:calc(env(safe-area-inset-bottom, 0px) + 24px)}
+@media (min-width:768px){
+  .app-shell{padding-bottom:32px}
+  .home-grid{grid-template-rows:repeat(2, 1fr); height:min(560px, calc(100dvh - 160px))}
+  .app-toast{bottom:24px}
+}
+</style>
 </head>
 <body>
 <div id="root"></div>
@@ -64,11 +94,11 @@ async function sheetPost(payload) {
 
 // ================= CLAUDE API =================
 function getApiKey() { return localStorage.getItem("cellar_api_key") || ""; }
-async function claude(content, { tools = null, max = 2000 } = {}) {
+async function claude(content, { tools = null, max = 2000, model = "claude-haiku-5-5" } = {}) {
   const key = getApiKey();
   if (!key) throw new Error("no-key");
   const bodyObj = {
-    model: "claude-sonnet-4-6",
+    model,
     max_tokens: max,
     messages: [{ role: "user", content }],
   };
@@ -100,7 +130,7 @@ function parseJSON(text) {
     return null;
   }
 }
-const WEB_SEARCH = [{ type: "web_search_20250305", name: "web_search" }];
+const WEB_SEARCH = [{ type: "web_search_20250305", name: "web_search", max_uses: 4 }];
 
 async function readLabel(base64, mediaType) {
   const text = await claude([
@@ -120,7 +150,7 @@ async function researchWine(w) {
     '{"region":"","subregion":"","category":"","description":"2-3 sentences","criticNotes":"summary of critic tasting notes",' +
     '"criticScores":"e.g. Wine Advocate 95, Vinous 93","criticWindow":"e.g. 2028-2045","windowStart":2028,"windowEnd":2045,' +
     '"currentValue":"approx per-bottle UK market value in GBP, number only or empty"}',
-    { tools: WEB_SEARCH, max: 3000 }
+    { tools: WEB_SEARCH, max: 3000, model: "claude-sonnet-5-5" }
   );
   return parseJSON(text);
 }
@@ -212,13 +242,75 @@ function CameraInput({ onImage, label }) {
           const f = e.target.files[0];
           if (!f) return;
           const r = new FileReader();
-          r.onload = () => onImage(r.result.split(",")[1], f.type);
+          r.onload = () => {
+            const img = new Image();
+            img.onload = () => {
+              const MAX = 1568;
+              const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+              const cv = document.createElement("canvas");
+              cv.width = Math.round(img.width * scale);
+              cv.height = Math.round(img.height * scale);
+              cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+              const dataUrl = cv.toDataURL("image/jpeg", 0.85);
+              onImage(dataUrl.split(",")[1], "image/jpeg");
+            };
+            img.onerror = () => onImage(null, null);
+            img.src = r.result;
+          };
           r.readAsDataURL(f);
           e.target.value = "";
         }} />
       <Btn primary onClick={() => ref.current.click()}>{label}</Btn>
     </>
   );
+}
+
+// ================= HOME TILE ICONS =================
+function TileIcon({ name, color }) {
+  const p = { fill: "none", stroke: color, strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round" };
+  const icons = {
+    // wine rack: arched cellar with bottle ends
+    browse: (<g {...p}>
+      <path d="M6 42V20a18 18 0 0 1 36 0v22" />
+      <path d="M4 42h40" />
+      {[[16,22],[24,22],[32,22],[12,30],[20,30],[28,30],[36,30],[16,38],[24,38],[32,38]].map(([x,y],i)=>(
+        <circle key={i} cx={x} cy={y} r="2.6" />))}
+    </g>),
+    // bottle with a plus
+    add: (<g {...p}>
+      <path d="M17 6h6v8c0 2 5 4 5 10v18a2 2 0 0 1-2 2H14a2 2 0 0 1-2-2V24c0-6 5-8 5-10z" />
+      <path d="M12 28h16" />
+      <circle cx="36" cy="34" r="8" />
+      <path d="M36 30v8M32 34h8" />
+    </g>),
+    // wine glass
+    drink: (<g {...p}>
+      <path d="M14 6h20l-1 12a9 9 0 0 1-18 0z" />
+      <path d="M15.5 14h17" />
+      <path d="M24 27v13" />
+      <path d="M16 42h16" />
+    </g>),
+    // magnifier over a label
+    lookup: (<g {...p}>
+      <rect x="6" y="8" width="24" height="30" rx="2" />
+      <path d="M11 15h14M11 21h10M11 27h8" />
+      <circle cx="31" cy="30" r="8" />
+      <path d="M37 36l6 6" />
+    </g>),
+    // shopping basket with bottle necks
+    shopping: (<g {...p}>
+      <path d="M17 18V7h4v11M27 18V9h4v9" />
+      <path d="M6 18h36l-4 22a2 2 0 0 1-2 2H12a2 2 0 0 1-2-2z" />
+      <path d="M17 26v10M24 26v10M31 26v10" />
+    </g>),
+    // open book
+    library: (<g {...p}>
+      <path d="M24 12c-4-3-10-4-18-4v28c8 0 14 1 18 4 4-3 10-4 18-4V8c-8 0-14 1-18 4z" />
+      <path d="M24 12v28" />
+      <path d="M11 16h8M11 22h8M29 16h8M29 22h8" />
+    </g>),
+  };
+  return <svg viewBox="0 0 48 48" width="52" height="52" aria-hidden="true">{icons[name]}</svg>;
 }
 
 function Spinner({ text }) {
@@ -253,7 +345,7 @@ function GuidedScore({ wine, onDone, onCancel }) {
         '{"appearance":"2-3 sentences","nose":"2-3 sentences","palate":"2-3 sentences","overall":"2-3 sentences"}'
       );
       setGuide(parseJSON(text) || {});
-    })();
+    })().catch(() => setGuide({}));
   }, []);
   const total = 50 + Object.values(scores).reduce((a, b) => a + b, 0);
   const s = SCORE_STEPS[step];
@@ -285,8 +377,10 @@ function GuidedScore({ wine, onDone, onCancel }) {
 }
 
 // ================= WINE DETAIL =================
-function WineDetail({ wine, journal, regions, onBack, onWithdraw, onAddNote, onSaveFields, onResearchRegion, dutyRate }) {
+function WineDetail({ wine, journal, regions, onBack, onWithdraw, onAddNote, onEditNote, onSaveFields, onResearchRegion, dutyRate }) {
   const [note, setNote] = useState("");
+  const [editingEntry, setEditingEntry] = useState(null);
+  const [editText, setEditText] = useState("");
   const [scoring, setScoring] = useState(false);
   const [pendingScore, setPendingScore] = useState(null);
   const [edit, setEdit] = useState({ Bottles: wine.Bottles || "", PricePaid: wine.PricePaid || "", CurrentValue: wine.CurrentValue || "" });
@@ -369,10 +463,25 @@ function WineDetail({ wine, journal, regions, onBack, onWithdraw, onAddNote, onS
       {entries.length === 0 && <div className="text-sm" style={{ ...body, color: C.faint }}>No entries yet — your notes across the years will build up here.</div>}
       {entries.map((e, i) => (
         <div key={i} className="rounded-lg p-3 mb-2" style={{ background: C.surface2, borderLeft: `3px solid ${C.claret}` }}>
-          <div className="text-xs" style={{ ...body, color: C.amber }}>
-            {e.Date} · {e.Type}{e.MyScore ? ` · your score ${e.MyScore}` : ""}
+          <div className="text-xs flex justify-between" style={{ ...body, color: C.amber }}>
+            <span>{e.Date} · {e.Type}{e.MyScore ? ` · your score ${e.MyScore}` : ""}</span>
+            {editingEntry !== e._row && (
+              <button onClick={() => { setEditingEntry(e._row); setEditText(e.Note || ""); }} style={{ color: C.dim }}>edit</button>
+            )}
           </div>
-          <div className="text-sm" style={{ ...body, color: C.text }}>{e.Note}</div>
+          {editingEntry === e._row ? (
+            <div>
+              <textarea value={editText} onChange={(ev) => setEditText(ev.target.value)} rows={3}
+                className="w-full rounded-lg p-2 mt-1"
+                style={{ ...body, background: C.bg, color: C.text, border: `1px solid ${C.line}` }} />
+              <div className="flex gap-2 mt-1">
+                <Btn small primary onClick={() => { onEditNote(e, editText); setEditingEntry(null); }}>Save</Btn>
+                <Btn small onClick={() => setEditingEntry(null)}>Cancel</Btn>
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm" style={{ ...body, color: C.text }}>{e.Note}</div>
+          )}
         </div>
       ))}
 
@@ -404,7 +513,10 @@ function ScanCard({ mode, cellar, onAddToCellar, onOpenWine, shoppingList, setSh
   const reset = () => { setScan(null); setResearch(null); setMatches([]); setFields({ Bottles: "", PricePaid: "", InBond: false }); };
 
   const onImage = async (b64, type) => {
-    reset(); setBusy("Reading label…");
+    reset();
+    if (!b64) { setScan({ error: true, msg: "Couldn't read that photo file — try taking it again." }); return; }
+    setBusy("Reading label…");
+    try {
     const label = await readLabel(b64, type);
     if (!label || !label.wine) { setBusy(null); setScan({ error: true }); return; }
     setScan(label);
@@ -423,6 +535,14 @@ function ScanCard({ mode, cellar, onAddToCellar, onOpenWine, shoppingList, setSh
     const res = await researchWine(label);
     setResearch(res || {});
     setBusy(null);
+    } catch (err) {
+      setBusy(null);
+      const m = String(err.message || err);
+      setScan({ error: true,
+        msg: m === "no-key"
+          ? "No API key on this device yet — add it under Library → Settings, then try again."
+          : "Scan failed: " + m + " — check your connection (or API credit) and try again." });
+    }
   };
 
   const buildRow = (status) => ({
@@ -447,7 +567,7 @@ function ScanCard({ mode, cellar, onAddToCellar, onOpenWine, shoppingList, setSh
         {scan && <Btn small onClick={reset}>Clear</Btn>}
       </div>
       {busy && <Spinner text={busy} />}
-      {scan?.error && <div className="text-sm mt-2" style={{ ...body, color: C.claret }}>Couldn't read that label — try again with the label filling the frame.</div>}
+      {scan?.error && <div className="text-sm mt-2" style={{ ...body, color: C.claret }}>{scan.msg || "Couldn't read that label — try again with the label filling the frame."}</div>}
 
       {/* Drink mode: pick the match */}
       {mode === "drink" && scan && !scan.error && (
@@ -524,7 +644,7 @@ function ScanCard({ mode, cellar, onAddToCellar, onOpenWine, shoppingList, setSh
 
 // ================= MAIN APP =================
 function WineCellar() {
-  const [view, setView] = useState("browse");
+  const [view, setView] = useState("home");
   const [cellarRaw, setCellarRaw] = useState([]);
   const [journal, setJournal] = useState([]);
   const [regions, setRegions] = useState([]);
@@ -579,6 +699,10 @@ function WineCellar() {
     await sheetPost({ tab: "Cellar", action: "update", row: wine._row, fields });
     flash("Saved"); loadAll();
   }
+  async function editNote(entry, newText) {
+    await sheetPost({ tab: "Journal", action: "update", row: entry._row, fields: { Note: newText } });
+    flash("Note updated"); loadAll();
+  }
   async function addNote(wine, note, score) {
     await sheetPost({ tab: "Journal", action: "append",
       fields: { Date: today(), WineID: wine.ID, Wine: wine.Wine, Vintage: wine.Vintage, Type: "note", Note: note, MyScore: score || "" } });
@@ -593,21 +717,31 @@ function WineCellar() {
     setSelected(null); setView("browse"); loadAll();
   }
   async function researchRegion(name) {
+    if (regions.some((r) => (r.Region || "").toLowerCase() === name.toLowerCase())) {
+      flash(`${name} is already in your library`); return;
+    }
     flash(`Researching ${name}…`);
     const text = await claude(
       `Write a wine-lover's reference entry on the wine region/appellation "${name}". Use web search if needed. ` +
       "Respond ONLY with JSON, no markdown: " +
       '{"Region":"' + name + '","Parent":"parent region if any","Overview":"3-4 sentences","Terroir":"2-3 sentences on soils",' +
       '"Climate":"2 sentences","Winemaking":"2-3 sentences on style/traditions","History":"2-3 sentences","Grapes":"key varieties"}',
-      { tools: WEB_SEARCH, max: 2500 }
+      { max: 2500 }
     );
     const entry = parseJSON(text);
     if (entry) { await sheetPost({ tab: "Regions", action: "append", fields: entry }); flash(`${name} added to your library`); loadAll(); }
     else flash("Research failed — try again");
   }
 
+  const [regionFilter, setRegionFilter] = useState("all");
+  const regionOptions = useMemo(() => {
+    const s = new Set();
+    cellar.forEach((w) => { if (w.Region) s.add(w.Region); if (w.Subregion) s.add(w.Subregion); });
+    return Array.from(s).sort();
+  }, [cellar]);
   const filtered = useMemo(() => {
     let list = cellar.filter((w) => num(w.Bottles) !== 0 || filter === "finished");
+    if (regionFilter !== "all") list = list.filter((w) => w.Region === regionFilter || w.Subregion === regionFilter);
     if (filter === "red") list = list.filter((w) => w.Category === "Red");
     if (filter === "white") list = list.filter((w) => w.Category === "White");
     if (filter === "window") list = list.filter((w) => ["in", "soon"].includes(windowStatus(w).key));
@@ -616,11 +750,37 @@ function WineCellar() {
     if (filter === "finished") list = cellar.filter((w) => w.Status === "Finished");
     if (search) list = list.filter((w) => (w.Wine + " " + w.Producer + " " + w.Region + " " + w.Vintage).toLowerCase().includes(search.toLowerCase()));
     return list.sort((a, b) => (num(a.WindowEnd) || 9999) - (num(b.WindowEnd) || 9999));
-  }, [cellar, filter, search]);
+  }, [cellar, filter, search, regionFilter]);
 
   const drinkSoon = cellar.filter((w) => windowStatus(w).key === "soon" && num(w.Bottles) > 0);
+  const needsResearch = cellarRaw.filter((w) => w.Status !== "Considering" && w.Wine && (!w.WindowEnd || !w.Description));
+  const [researching, setResearching] = useState(false);
+  async function startResearch() {
+    setResearching(true);
+    try {
+      const res = await sheetPost({ tab: "Cellar", action: "research", key: getApiKey() });
+      if (res.error === "no-key") flash("Add your API key under Library → Settings first");
+      else if (res.error) flash("Couldn't start: " + res.error);
+      else if (!res.pending && !res.regions) flash("Everything's already researched");
+      else flash(`Researching ${res.pending} wine${res.pending === 1 ? "" : "s"}${res.regions ? ` and ${res.regions} region${res.regions === 1 ? "" : "s"}` : ""} — refresh in a few minutes`);
+    } catch (e) {
+      flash("Couldn't reach your Sheet — try again");
+    }
+    setResearching(false);
+  }
 
   const NAV = [["browse", "Cellar"], ["add", "Add"], ["drink", "Drink"], ["lookup", "Lookup"], ["shopping", "Shopping"], ["library", "Library"]];
+  const go = (k) => { setView(k); setSelected(null); window.scrollTo(0, 0); };
+  const bottleCount = cellar.reduce((a, w) => a + (num(w.Bottles) || 0), 0);
+  const TILES = [
+    ["browse", "Cellar", `${bottleCount} bottles${drinkSoon.length ? ` · ${drinkSoon.length} to drink soon` : ""}`],
+    ["add", "Add", "Snap a new bottle"],
+    ["drink", "Drink", "Open a bottle"],
+    ["lookup", "Lookup", "Read about a wine"],
+    ["shopping", "Shopping", shoppingList.length ? `${shoppingList.length} on this trip` : "Snap bottles in store"],
+    ["library", "Library", "Regions & settings"],
+  ];
+  const viewName = (NAV.find(([k]) => k === view) || [])[1];
 
   return (
     <div className="min-h-screen" style={{ background: C.bg }}>
@@ -629,22 +789,33 @@ function WineCellar() {
         details summary::-webkit-details-marker { color: ${C.amber} }
         input[type=range]::-webkit-slider-thumb { cursor: pointer }
       `}</style>
-      <div className="max-w-5xl mx-auto px-4 pb-24 md:pb-8 pt-5">
+      <div className="max-w-5xl mx-auto app-shell">
         {/* Header */}
         <div className="flex items-baseline justify-between mb-4">
           <div>
-            <div style={{ ...font, fontSize: 24, color: C.white }}>Cliverton Cellars</div>
+            {view !== "home" && (
+              <button onClick={() => go("home")} className="md:hidden text-sm mb-1 block"
+                style={{ ...body, color: C.amber }}>← Home</button>
+            )}
+            <div style={{ ...font, fontSize: view === "home" ? 26 : 22, color: C.white }}>
+              {view === "home" ? "Cliverton Cellars" : <><span className="hidden md:inline">Cliverton Cellars</span><span className="md:hidden">{viewName}</span></>}
+            </div>
             <div className="text-xs" style={{ ...body, color: C.faint }}>
               {cellar.reduce((a, w) => a + (num(w.Bottles) || 0), 0)} bottles · {cellar.filter((w) => num(w.Bottles) > 0).length} wines
             </div>
           </div>
-          <button onClick={loadAll} className="text-sm" style={{ ...body, color: C.amber }}>↻ refresh</button>
+          <div className="flex flex-col items-end gap-1">
+            <button onClick={loadAll} className="text-sm" style={{ ...body, color: C.amber }}>↻ refresh</button>
+            <button onClick={startResearch} disabled={researching} className="text-xs" style={{ ...body, color: needsResearch.length ? C.amberSoft : C.faint }}>
+              {researching ? "researching…" : `🔎 research new wines${needsResearch.length ? ` (${needsResearch.length})` : ""}`}
+            </button>
+          </div>
         </div>
 
         {/* Desktop nav */}
-        <div className="hidden md:flex gap-1 mb-5">
-          {NAV.map(([k, l]) => (
-            <button key={k} onClick={() => { setView(k); setSelected(null); }}
+        <div className={view === "home" ? "hidden" : "hidden md:flex gap-1 mb-5"}>
+          {[["home", "Home"], ...NAV].map(([k, l]) => (
+            <button key={k} onClick={() => go(k)}
               className="px-4 py-2 rounded-lg text-sm"
               style={{ ...body, background: view === k ? C.claret : "transparent", color: view === k ? C.white : C.dim }}>
               {l}{k === "shopping" && shoppingList.length ? ` (${shoppingList.length})` : ""}
@@ -668,7 +839,21 @@ function WineCellar() {
             <Field label="Anthropic API key" value={apiKey} onChange={saveApiKey} placeholder="sk-ant-..." />
           </div>
         )}
-        {!loading && !error && (
+        {!error && view === "home" && (
+          <div className="home-grid grid grid-cols-2 md:grid-cols-3 gap-3">
+            {TILES.map(([k, label, sub]) => (
+              <button key={k} onClick={() => go(k)}
+                className="home-tile rounded-2xl flex flex-col items-center justify-center text-center px-3"
+                style={{ background: k === "browse" && drinkSoon.length ? `linear-gradient(160deg, ${C.surface2}, ${C.claretDeep}55)` : C.surface,
+                  border: `1px solid ${C.line}` }}>
+                <TileIcon name={k} color={k === "drink" ? C.claret : C.amber} />
+                <div className="mt-3" style={{ ...font, fontSize: 21, color: C.white }}>{label}</div>
+                <div className="text-xs mt-1" style={{ ...body, color: C.dim }}>{sub}</div>
+              </button>
+            ))}
+          </div>
+        )}
+        {!loading && !error && view !== "home" && (
           <div className="md:grid md:grid-cols-5 md:gap-6">
             {/* LEFT PANE (list) — full width on phone unless detail open */}
             <div className={`md:col-span-2 ${selected ? "hidden md:block" : ""}`}>
@@ -685,12 +870,20 @@ function WineCellar() {
                     className="w-full rounded-lg px-3 py-2 mb-2"
                     style={{ ...body, background: C.surface, color: C.text, border: `1px solid ${C.line}` }} />
                   <div className="flex gap-1 flex-wrap mb-3">
-                    {[["all", "All"], ["window", "Drink now"], ["soon", "Drink soon"], ["red", "Red"], ["white", "White"], ["incomplete", "Needs info"], ["finished", "Finished"]].map(([k, l]) => (
+                    {[["all", "All"], ["window", "Drink now"], ["soon", "Drink soon"], ["red", "Red"], ["white", "White"], ["incomplete", "Needs info"], ["finished", "Drunk"]].map(([k, l]) => (
                       <button key={k} onClick={() => setFilter(k)} className="px-3 py-1 rounded-full text-xs"
                         style={{ ...body, background: filter === k ? C.amber : C.surface2, color: filter === k ? C.bg : C.dim }}>
                         {l}
                       </button>
                     ))}
+                    {regionOptions.length > 0 && (
+                      <select value={regionFilter} onChange={(e) => setRegionFilter(e.target.value)}
+                        className="px-3 py-1 rounded-full text-xs"
+                        style={{ ...body, background: regionFilter !== "all" ? C.amber : C.surface2, color: regionFilter !== "all" ? C.bg : C.dim, border: "none" }}>
+                        <option value="all">All regions</option>
+                        {regionOptions.map((r) => <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    )}
                   </div>
                   {filtered.length === 0 && (
                     <div className="text-sm rounded-xl p-6 text-center" style={{ ...body, color: C.faint, border: `1px dashed ${C.line}` }}>
@@ -710,6 +903,15 @@ function WineCellar() {
                       <WindowBar w={w} />
                     </button>
                   ))}
+                  {filter === "all" && cellar.some((w) => w.Status === "Finished") && (
+                    <button onClick={() => setFilter("finished")} className="w-full text-left rounded-xl p-3 mt-2"
+                      style={{ background: "transparent", border: `1px dashed ${C.line}` }}>
+                      <div style={{ ...font, fontSize: 15, color: C.dim }}>
+                        🕯 Previously drunk · {cellar.filter((w) => w.Status === "Finished").length} wine{cellar.filter((w) => w.Status === "Finished").length > 1 ? "s" : ""}
+                      </div>
+                      <div className="text-xs" style={{ ...body, color: C.faint }}>your history and notes — tap to browse</div>
+                    </button>
+                  )}
                 </>
               )}
 
@@ -736,7 +938,7 @@ function WineCellar() {
                 <>
                   <div style={{ ...font, fontSize: 20, color: C.amberSoft }} className="mb-2">Your regions</div>
                   {regions.length === 0 && <div className="text-sm" style={{ ...body, color: C.faint }}>The library grows as your cellar does — open any wine and tap "Research this region".</div>}
-                  {regions.map((r) => (
+                  {regions.filter((r, i) => regions.findIndex((x) => (x.Region || "").toLowerCase() === (r.Region || "").toLowerCase()) === i).map((r) => (
                     <details key={r._row} className="rounded-xl p-3 mb-2" style={{ background: C.surface, border: `1px solid ${C.line}` }}>
                       <summary className="cursor-pointer" style={{ ...font, fontSize: 17, color: C.text }}>
                         {r.Region} {r.Parent && <span className="text-xs" style={{ ...body, color: C.faint }}>· {r.Parent}</span>}
@@ -766,7 +968,7 @@ function WineCellar() {
               {selected ? (
                 <WineDetail wine={cellar.find((w) => w._row === selected._row) || selected}
                   journal={journal} regions={regions} dutyRate={dutyRate}
-                  onBack={() => setSelected(null)} onWithdraw={withdraw} onAddNote={addNote}
+                  onBack={() => setSelected(null)} onWithdraw={withdraw} onAddNote={addNote} onEditNote={editNote}
                   onSaveFields={saveFields} onResearchRegion={researchRegion} />
               ) : (
                 <div className="hidden md:flex items-center justify-center h-64 rounded-xl text-sm"
@@ -779,19 +981,8 @@ function WineCellar() {
         )}
       </div>
 
-      {/* Mobile bottom nav */}
-      <div className="md:hidden fixed bottom-0 left-0 right-0 flex justify-around py-2"
-        style={{ background: `${C.surface}f2`, borderTop: `1px solid ${C.line}`, backdropFilter: "blur(8px)" }}>
-        {NAV.map(([k, l]) => (
-          <button key={k} onClick={() => { setView(k); setSelected(null); }} className="px-2 py-1 text-xs rounded"
-            style={{ ...body, color: view === k ? C.amber : C.dim }}>
-            {l}{k === "shopping" && shoppingList.length ? `·${shoppingList.length}` : ""}
-          </button>
-        ))}
-      </div>
-
       {toast && (
-        <div className="fixed bottom-16 md:bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm"
+        <div className="fixed left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-sm app-toast"
           style={{ ...body, background: C.amber, color: C.bg }}>
           {toast}
         </div>
